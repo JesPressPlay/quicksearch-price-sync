@@ -1,0 +1,26 @@
+{
+  "name": "quicksearch-price-sync",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Market price syncing between Quick Search Games and JustTCG API",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JesPressPlay/quicksearch-price-sync.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/JesPressPlay/quicksearch-price-sync/issues"
+  },
+  "homepage": "https://github.com/JesPressPlay/quicksearch-price-sync#readme",
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "justtcg-js": "^0.1.26",
+    "node-cron": "^4.2.1"
+  }
+}
