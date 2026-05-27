@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { JustTCG } from 'justtcg-js';
 import { URLSearchParams } from 'node:url';
 
 const SHOP = process.env.SHOPIFY_SHOP;
@@ -62,8 +63,11 @@ async function graphql(query, variables = {}) {
   return data;
 }
 
-async function main() {
-  const query = `
+// Beginning of functions that will handle the syncing logic between JustTCG and Shopify
+
+// Get all Shopify Variants
+async function getShopifyVariants() {
+      const query = `
     {
       productVariants(first: 250) {
         edges {
@@ -88,7 +92,99 @@ async function main() {
     }
   `;
   const data = await graphql(query);
-  console.log('Variants:', JSON.stringify(data, null, 2));
+  return data.productVariants.edges;
+}
+
+// Function that calls JustTCG with tcgplayer_id and finds the matching variant by
+// comparing 'printing' and 'condition' and returns the matched price
+async function getJustTCGPrice(tcgplayerid, printing, condition) {
+    try {
+        const client = new JustTCG({ apiKey: process.env.JUSTTCG_API_KEY });
+        const { data } = await client.v1.cards.get({ tcgplayerId: tcgplayerid });
+
+        const match = data[0].variants.find(
+            (variant) => variant.printing === printing && variant.condition === condition
+        );
+
+        if (!match) {
+            console.log(`No matching variant found for tcgplayerId: ${tcgplayerid}, printing: ${printing}, condition: ${condition}`);
+            return null;
+        }
+
+        return match.price;
+
+    } catch (error) {
+        console.error(`JustTCG API error for tcgplayerId ${tcgplayerid}:`, error);
+        return null;
+    }
+}
+
+// Writes data back to Shopify and updates prices
+async function updateShopifyPrice(variantId, price) {
+    try {
+        const variables = {
+            input: {
+                id: variantId,
+                price: String(price)
+            }
+        };
+        const mutation = `
+        mutation updatePrice($input: ProductVariantInput!) {
+            productVariantUpdate(input: $input) {
+                productVariant {
+                    id
+                    price
+                }
+            }
+        }
+        `
+
+        await graphql(mutation, variables);
+
+        console.log(`Successfully updated variant ${variantId} to $${price}`);
+
+    } catch (error) {
+        console.error(`Error in updating variant ${variantId} to $${price}`);
+        return null;
+    }
+}
+
+// Delay between each JustTCG call
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Main function that orchestrates each part of the syncing steps that are written above
+async function main() {
+    const variants = await getShopifyVariants();
+
+    for (const edge of variants) {
+        const variant = edge.node;
+
+        // Skip variants with no TCGPlayerID set
+        if (variant.metafields.edges.length === 0) continue;
+
+        // Grab the TCGPlayerId from the metafield
+        const tcgplayerId = variant.metafields.edges[0].node.value;
+
+        // Grab printing and condition from selectedOptions
+        const printing = variant.selectedOptions.find(
+        (option) => option.name === "Card attributes"
+        )?.value;
+
+        const condition = variant.selectedOptions.find(
+        (option) => option.name === "Condition"
+        )?.value;
+
+        const newPrice = await getJustTCGPrice(tcgplayerId, printing, condition);
+
+        await sleep(500);
+        
+        // Update the price if we got one back and it's different from current
+        if (newPrice && newPrice !== parseFloat(variant.price)) {
+            await updateShopifyPrice(variant.id, newPrice);
+        }
+    }
 }
 
 main().catch((error) => {
