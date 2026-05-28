@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { JustTCG } from 'justtcg-js';
 import { URLSearchParams } from 'node:url';
+import cron from 'node-cron';
 
 const SHOP = process.env.SHOPIFY_SHOP;
 const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
@@ -206,7 +207,16 @@ async function main() {
     }
 }
 
+// Run immediately on startup
 main().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
+    console.error(error);
+    process.exitCode = 1;
+});
+
+// Then, schedule to run every 6 hours
+cron.schedule('0 */6 * * *', () => {
+    console.log('Running scheduled price sync...');
+    main().catch((error) => {
+        console.error(error);
+    });
 });
