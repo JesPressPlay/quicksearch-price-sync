@@ -2,11 +2,12 @@ import 'dotenv/config';
 import { JustTCG } from 'justtcg-js';
 import { URLSearchParams } from 'node:url';
 import cron from 'node-cron';
-import { connect } from 'node:http2';
 
 const SHOP = process.env.SHOPIFY_SHOP;
 const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
+const BATCH_SIZE = 100; // JustTCG batch cap on Starter/Pro Tiers
+const justtcg = new JustTCG({ apiKey: process.env.JUSTTCG_API_KEY }); // call JustTCG client once, rather than inside the function on every call.
 
 if (!SHOP || !CLIENT_ID || !CLIENT_SECRET) {
   throw new Error(
@@ -126,41 +127,16 @@ async function getShopifyVariants() {
     cursor = connection.pageInfo.endCursor;
 
   }
-  
+
   console.log(`Fetched ${allEdges.length} variants`);
   // Using this log to confirm pagination pulled the full variant count, not just the 250 cap.
   return allEdges;
 }
 
-// Function that calls JustTCG with tcgplayer_id and finds the matching variant by
-// comparing 'printing' and 'condition' and returns the matched price
-async function getJustTCGPrice(tcgplayerid, printing, condition) {
-    try {
-        const client = new JustTCG({ apiKey: process.env.JUSTTCG_API_KEY });
-        const { data } = await client.v1.cards.get({ tcgplayerId: tcgplayerid });
-
-        const match = data[0].variants.find(
-            (variant) => variant.printing.trim() === printing.trim() && variant.condition.trim() === condition.trim()
-        );
-        
-
-        if (!match) {
-            console.log(`No matching variant found for tcgplayerId: ${tcgplayerid}, printing: ${printing}, condition: ${condition}. Available variants:`, JSON.stringify(data[0].variants.map(v => ({ printing: v.printing, condition: v.condition }))));
-            return null
-        }
-
-        return match.price;
-
-    } catch (error) {
-        console.error(`JustTCG API error for tcgplayerId ${tcgplayerid}:`, error);
-        return null;
-    }
-}
-
 // Writes data back to Shopify and updates prices
 async function updateShopifyPrice(productId, variantId, price) {
-    try {
-        const mutation = `
+  try {
+    const mutation = `
             mutation updatePrice($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
                 productVariantsBulkUpdate(productId: $productId, variants: $variants) {
                     productVariants {
@@ -175,73 +151,132 @@ async function updateShopifyPrice(productId, variantId, price) {
             }
         `;
 
-        const variables = {
-            productId: productId,
-            variants: [{ id: variantId, price: String(price) }]
-        };
+    const variables = {
+      productId: productId,
+      variants: [{ id: variantId, price: String(price) }]
+    };
 
-        await graphql(mutation, variables);
-        console.log(`Successfully updated variant ${variantId} to $${price}`);
+    await graphql(mutation, variables);
+    console.log(`Successfully updated variant ${variantId} to $${price}`);
 
-    } catch (error) {
-        console.error(`Error updating variant ${variantId}:`, error);
-        return null;
-    }
+  } catch (error) {
+    console.error(`Error updating variant ${variantId}:`, error);
+    return null;
+  }
 }
 
 // Setting a delay between each JustTCG call, as to not hit rate limits
 function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Splits a flat array into smaller arrays of at most 'size' items each,
+// so each chun can be sent as one batch request (JustTCG caps batches at 100).
+function chunkArray(array, size) {
+  const chunks = [];
+
+  for (let i = 0; i < array.length; i += size) {
+    const newSlice = array.slice(i, i + size);
+    chunks.push(newSlice);
+  }
+
+  return chunks;
 }
 
 // Main function that orchestrates each part of the syncing steps that are written above. The meat and potatoes.
 async function main() {
-    const variants = await getShopifyVariants();
+  const variants = await getShopifyVariants();
+  const lookupArray = []; // Empty array for eventually storing batch requests
 
-    for (const edge of variants) {
-        const variant = edge.node;
+  for (const edge of variants) {
+    const variant = edge.node;
 
-        // Skip variants with no TCGPlayerID set
-        if (variant.metafields.edges.length === 0) continue;
+    // Skip variants with no TCGPlayerID set
+    if (variant.metafields.edges.length === 0) continue;
 
-        // Skip variants with an inventory number of 0
-        if (variant.inventoryQuantity === 0) continue;
+    // Skip variants with an inventory number of 0
+    if (variant.inventoryQuantity === 0) continue;
 
-        // Grab the TCGPlayerId from the metafield
-        const tcgplayerId = variant.metafields.edges[0].node.value;
+    // Grab the TCGPlayerId from the metafield
+    const tcgplayerId = variant.metafields.edges[0].node.value;
 
-        // Grab printing and condition from selectedOptions
-        const printing = variant.selectedOptions.find(
-        (option) => option.name === "Card attributes"
-        )?.value;
+    // Grab printing and condition from selectedOptions
+    const printing = variant.selectedOptions.find(
+      (option) => option.name === "Card attributes"
+    )?.value;
 
-        const condition = variant.selectedOptions.find(
-        (option) => option.name === "Condition"
-        )?.value;
+    const condition = variant.selectedOptions.find(
+      (option) => option.name === "Condition"
+    )?.value;
 
-        const newPrice = await getJustTCGPrice(tcgplayerId, printing, condition);
-        const productId = variant.product.id;
+    // Build the batch payload. Will also need productId + variant.id here later
+    // to map prices back to the right variant in the update phase.
+    lookupArray.push({ tcgplayerId, condition, printing });
+  }
 
-        // Once above info is gathered, wait 1 second between the next call
-        await sleep(1000);
+  // --- Phase 1: FETCH ---
+  // Split the lookups into <100 card chunks, and send each as one batch request,
+  // and accumulate every returned card into a single, flat array.
+  const chunks = chunkArray(lookupArray, BATCH_SIZE);
+  const allResults = [];
 
-        // Update the price if we got one back and it's different from current
-        if (newPrice && newPrice !== parseFloat(variant.price)) {
-            await updateShopifyPrice(productId, variant.id, newPrice);
-        }
+  for (const chunk of chunks) {
+    const { data } = await justtcg.v1.cards.getByBatch(chunk);
+    allResults.push(...data);
+    await sleep(1000); // must be polite to the rate limiter between batches
+  }
+
+  console.log(`Fetched prices for ${allResults.length} cards across ${chunks.length} batch(es)`);
+
+  // --- Phase 2: Build price lookup ---
+  // Next, flatten the nested card/variants structure into a flat table keyed by
+  // tcgplayerId|printing|condition, so each price is an instant lookup.
+  const priceLookup = {};
+
+  for (const card of allResults) {
+    for (const variant of card.variants) {
+      const key = `${card.tcgplayerId}|${variant.printing.trim()}|${variant.condition.trim()}`;
+      priceLookup[key] = variant.price;
     }
+  }
+
+  // --- Phase 3: Match and Update! ---
+  // Finally, loop the Shopify variants again, build the same key, look up the price,
+  // and update if it changes. variant.id and productId are right here in hand.
+  for (const edge of variants) {
+    const variant = edge.node;
+
+    if (variant.metafields.edges.length === 0) continue;
+    if (variant.inventoryQuantity === 0) continue;
+
+    const tcgplayerId = variant.metafields.edges[0].node.value;
+    const printing = variant.selectedOptions.find(
+      (option) => option.name === "Card attributes"
+    )?.value;
+    const condition = variant.selectedOptions.find(
+      (option) => option.name === "Condition"
+    )?.value;
+
+    const key = `${tcgplayerId}|${printing.trim()}|${condition.trim()}`;
+    const newPrice = priceLookup[key];
+
+    if (newPrice && newPrice !== parseFloat(variant.price)) {
+      const productId = variant.product.id;
+      await updateShopifyPrice(productId, variant.id, newPrice);
+    }
+  }
 }
 
 // Run immediately on startup
 main().catch((error) => {
-    console.error(error);
-    process.exitCode = 1;
+  console.error(error);
+  process.exitCode = 1;
 });
 
-// Then, schedule to run every 12 hours
-cron.schedule('0 */12 * * *', () => {
-    console.log('Running scheduled price sync...');
-    main().catch((error) => {
-        console.error(error);
-    });
+// Then, schedule to run every 6 hours
+cron.schedule('0 */6 * * *', () => {
+  console.log('Running scheduled price sync...');
+  main().catch((error) => {
+    console.error(error);
+  });
 });
