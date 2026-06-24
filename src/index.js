@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { JustTCG } from 'justtcg-js';
 import { URLSearchParams } from 'node:url';
 import cron from 'node-cron';
+import { connect } from 'node:http2';
 
 const SHOP = process.env.SHOPIFY_SHOP;
 const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
@@ -75,16 +76,16 @@ async function graphql(query, variables = {}) {
 // Returns an array of variant edges containing id, price, inventory,
 // selectedOptions, product id, and metafields.
 async function getShopifyVariants() {
-      const query = `
-    {
-      productVariants(first: 250) {
+  const query = `
+    query getVariants($cursor: String) {
+      productVariants(first: 250, after: $cursor) {
         edges {
           node {
             id
             inventoryQuantity
             price
             product {
-                id
+              id
             }
             selectedOptions {
               name
@@ -100,11 +101,35 @@ async function getShopifyVariants() {
             }
           }
         }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }  
       }
     }
   `;
-  const data = await graphql(query);
-  return data.productVariants.edges;
+
+  let allEdges = []; // Accumulates all of the page results into an empty array
+  let cursor = null; // Starts empty, page 1 starts from the beginning
+  let hasNextPage = true; // Purely just gets us into the loop the first time, the primer.
+
+  // Next, the loop keeps going as long as Shopify says there's more to fetch.
+  // Loop will stop once we've looked through every page.
+  while (hasNextPage) {
+    const data = await graphql(query, { cursor });
+    const connection = data.productVariants;
+
+    allEdges = allEdges.concat(connection.edges);
+    // Merging two arrays into one. Glues every fetch of 250 together into the running total.
+
+    hasNextPage = connection.pageInfo.hasNextPage;
+    cursor = connection.pageInfo.endCursor;
+
+  }
+  
+  console.log(`Fetched ${allEdges.length} variants`);
+  // Using this log to confirm pagination pulled the full variant count, not just the 250 cap.
+  return allEdges;
 }
 
 // Function that calls JustTCG with tcgplayer_id and finds the matching variant by
