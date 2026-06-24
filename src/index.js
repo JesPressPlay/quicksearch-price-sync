@@ -213,8 +213,8 @@ main().catch((error) => {
     process.exitCode = 1;
 });
 
-// Then, schedule to run every 6 hours
-cron.schedule('0 */6 * * *', () => {
+// Then, schedule to run every 12 hours
+cron.schedule('0 */12 * * *', () => {
     console.log('Running scheduled price sync...');
     main().catch((error) => {
         console.error(error);
