@@ -5,6 +5,7 @@
   "description": "Market price syncing between Quick Search Games and JustTCG API",
   "main": "src/index.js",
   "scripts": {
+    "start": "node src/index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
